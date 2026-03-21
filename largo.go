@@ -143,15 +143,18 @@ func (sw *Writer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Flush renders whatever remains in the buffer. Call when the stream ends.
+// Flush renders whatever remains in the buffer. Call when the stream ends
+// or before switching to a different output mode (e.g., tool output).
 func (sw *Writer) Flush() error {
 	if sw.buf.Len() == 0 {
 		return nil
 	}
+	content := sw.buf.String()
+	sw.buf.Reset()
 	if err := sw.eraseRaw(); err != nil {
 		return err
 	}
-	return sw.renderAndWrite(sw.buf.String())
+	return sw.renderAndWrite(content)
 }
 
 // echoRaw writes raw bytes to the terminal and updates the line counter.

@@ -381,10 +381,12 @@ func (sw *Writer) renderAndWrite(block string) error {
 		return err
 	}
 	// Glamour wraps each render with leading/trailing newlines even with
-	// our custom style. Trim them so block-by-block output doesn't
-	// accumulate extra blank lines.
+	// our custom style. Trim the leading newlines so block-by-block
+	// output doesn't accumulate extra blank lines at the top.
+	// At the trailing end, collapse to at most two newlines (one blank
+	// line) to preserve paragraph breaks without runaway spacing.
 	rendered = strings.TrimLeft(rendered, "\n")
-	rendered = strings.TrimRight(rendered, "\n") + "\n"
+	rendered = trimTrailingNewlines(rendered, 2)
 
 	// Add a blank line before headings for visual separation.
 	trimmed := strings.TrimSpace(block)
@@ -394,6 +396,20 @@ func (sw *Writer) renderAndWrite(block string) error {
 
 	_, err = io.WriteString(sw.w, rendered)
 	return err
+}
+
+// trimTrailingNewlines removes trailing newlines beyond maxNewlines.
+// Ensures the string ends with at most maxNewlines newline characters.
+func trimTrailingNewlines(s string, maxNewlines int) string {
+	end := len(s)
+	for end > 0 && s[end-1] == '\n' {
+		end--
+	}
+	trailing := len(s) - end
+	if trailing > maxNewlines {
+		trailing = maxNewlines
+	}
+	return s[:end+trailing]
 }
 
 func isLineStart(s string, i int) bool {

@@ -31,13 +31,12 @@ import (
 type Options struct {
 	// Width is the terminal width in columns, used to calculate how many
 	// terminal rows a line of raw text occupies (for accurate erasure).
-	// Defaults to 80 if zero.
+	// Defaults to auto-detected terminal width, falling back to 80.
 	Width int
 
-	// Margin is the number of columns to subtract from Width when
-	// configuring glamour's word wrap. Glamour's default style adds a
-	// 2-char left margin, so Margin should be at least 2 to avoid
-	// wrapping. Defaults to 2 if zero.
+	// Margin is deprecated. The correct word-wrap width is now computed
+	// automatically from the glamour style's document margin. Callers
+	// should remove any Margin override.
 	Margin int
 }
 
@@ -92,18 +91,27 @@ func New(w io.Writer, renderer *glamour.TermRenderer, opts Options) *Writer {
 // streamingStyle returns a glamour style tuned for block-by-block rendering.
 // It removes the document-level and heading padding that glamour adds for
 // full-document renders, since those cause doubled spacing when blocks are
-// rendered independently.
-func streamingStyle() glamour.TermRendererOption {
+// rendered independently. Returns the style option and the document margin
+// (in columns) that glamour will add to each line.
+func streamingStyle() (glamour.TermRendererOption, int) {
 	style := styles.DarkStyleConfig
 	style.Document.BlockPrefix = ""
 	style.Document.BlockSuffix = ""
 	style.Heading.BlockSuffix = ""
-	return glamour.WithStyles(style)
+
+	docMargin := 0
+	if style.Document.Margin != nil {
+		docMargin = int(*style.Document.Margin)
+	}
+
+	return glamour.WithStyles(style), docMargin
 }
 
 // NewWriter creates a Writer with its own glamour renderer, using the
 // detected (or provided) terminal width for both line tracking and rendering.
-// This ensures the two widths are always in sync.
+// The word-wrap width is computed automatically: terminal width minus the
+// glamour style's document margin, so rendered output fits the terminal
+// exactly without overflow or wasted columns.
 func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 	if opts.Width <= 0 {
 		opts.Width = terminalWidth(w)
@@ -111,12 +119,13 @@ func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 	if opts.Width <= 0 {
 		opts.Width = 80
 	}
-	if opts.Margin <= 0 {
-		opts.Margin = 2
-	}
+
+	styleOpt, docMargin := streamingStyle()
+	wrapWidth := opts.Width - docMargin
+
 	r, err := glamour.NewTermRenderer(
-		streamingStyle(),
-		glamour.WithWordWrap(opts.Width-opts.Margin),
+		styleOpt,
+		glamour.WithWordWrap(wrapWidth),
 	)
 	if err != nil {
 		return nil, err

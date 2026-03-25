@@ -19,9 +19,11 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/styles"
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
 
@@ -158,25 +160,89 @@ func (sw *Writer) Flush() error {
 }
 
 // echoRaw writes raw bytes to the terminal and updates the line counter.
+// Column tracking accounts for ANSI escape sequences (zero width),
+// tab stops, and multi-column characters (CJK, emoji).
 func (sw *Writer) echoRaw(p []byte) error {
 	if _, err := sw.w.Write(p); err != nil {
 		return err
 	}
-	// Track terminal rows consumed.
-	for _, b := range p {
+	// Track terminal rows consumed using rune widths.
+	i := 0
+	for i < len(p) {
+		b := p[i]
+
+		// Newline: always moves to next row.
 		if b == '\n' {
 			sw.rawLines++
 			sw.colPos = 0
-		} else {
-			sw.colPos++
+			i++
+			continue
+		}
+
+		// Carriage return: moves to column 0 without advancing row.
+		if b == '\r' {
+			sw.colPos = 0
+			i++
+			continue
+		}
+
+		// ANSI escape sequence: skip entirely (zero visual width).
+		if b == '\x1b' && i+1 < len(p) && p[i+1] == '[' {
+			// CSI sequence: \x1b[ ... <terminator>
+			j := i + 2
+			for j < len(p) && !isCSITerminator(p[j]) {
+				j++
+			}
+			if j < len(p) {
+				j++ // skip the terminator byte
+			}
+			i = j
+			continue
+		}
+
+		// Tab: advance to next 8-column tab stop.
+		if b == '\t' {
+			advance := 8 - (sw.colPos % 8)
+			sw.colPos += advance
 			if sw.colPos >= sw.opts.Width {
-				// Soft wrap: terminal moves to next row.
 				sw.rawLines++
 				sw.colPos = 0
 			}
+			i++
+			continue
 		}
+
+		// Other control characters (bell, backspace, etc.): skip.
+		if b < 0x20 {
+			i++
+			continue
+		}
+
+		// Decode a full rune and measure its display width.
+		r, size := utf8.DecodeRune(p[i:])
+		w := runewidth.RuneWidth(r)
+		sw.colPos += w
+		if sw.colPos > sw.opts.Width {
+			// Character doesn't fit on current line — terminal wraps
+			// before printing it, so it starts on the next row.
+			sw.rawLines++
+			sw.colPos = w
+		} else if sw.colPos == sw.opts.Width {
+			// Exactly filled the row. Terminal may or may not wrap yet
+			// (deferred wrap). Treat as wrapped — the next visible
+			// character will be on a new row.
+			sw.rawLines++
+			sw.colPos = 0
+		}
+		i += size
 	}
 	return nil
+}
+
+// isCSITerminator returns true if b is the final byte of a CSI escape
+// sequence (the range 0x40–0x7E, i.e. @ through ~).
+func isCSITerminator(b byte) bool {
+	return b >= 0x40 && b <= 0x7E
 }
 
 // eraseRaw moves the cursor up and clears each row of raw output, leaving

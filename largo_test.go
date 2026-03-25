@@ -168,6 +168,110 @@ func TestEchoRaw_SoftWrap(t *testing.T) {
 	}
 }
 
+func TestEchoRaw_ANSIEscapes(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 80}}
+
+	// ANSI color codes should have zero visual width.
+	sw.echoRaw([]byte("\x1b[31mhello\x1b[0m\n"))
+	if sw.rawLines != 1 {
+		t.Fatalf("expected 1 raw line, got %d", sw.rawLines)
+	}
+	if sw.colPos != 0 {
+		t.Fatalf("expected colPos 0 after newline, got %d", sw.colPos)
+	}
+}
+
+func TestEchoRaw_ANSISoftWrap(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 10}}
+
+	// 10 visible chars + ANSI escapes should wrap exactly once.
+	sw.echoRaw([]byte("\x1b[32m1234567890\x1b[0m"))
+	if sw.rawLines != 1 {
+		t.Fatalf("expected 1 soft-wrap line, got %d", sw.rawLines)
+	}
+	if sw.colPos != 0 {
+		t.Fatalf("expected colPos 0 after exact fill, got %d", sw.colPos)
+	}
+}
+
+func TestEchoRaw_Tabs(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 80}}
+
+	// "ab\t" = 2 cols + tab to col 8 = 8 cols total
+	sw.echoRaw([]byte("ab\t"))
+	if sw.colPos != 8 {
+		t.Fatalf("expected colPos 8 after tab, got %d", sw.colPos)
+	}
+}
+
+func TestEchoRaw_TabSoftWrap(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 10}}
+
+	// "12345678\t" = 8 cols + tab advances to 16 which exceeds width 10
+	sw.echoRaw([]byte("12345678\t"))
+	if sw.rawLines != 1 {
+		t.Fatalf("expected 1 soft-wrap, got %d", sw.rawLines)
+	}
+}
+
+func TestEchoRaw_MultiByteRunes(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 80}}
+
+	// Emoji (typically 2 columns wide)
+	sw.echoRaw([]byte("🎭"))
+	if sw.colPos != 2 {
+		t.Fatalf("expected colPos 2 for emoji, got %d", sw.colPos)
+	}
+}
+
+func TestEchoRaw_CJKWideChars(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 10}}
+
+	// 5 CJK characters = 10 columns = exactly fills width
+	sw.echoRaw([]byte("漢字漢字漢"))
+	if sw.rawLines != 1 {
+		t.Fatalf("expected 1 soft-wrap, got %d", sw.rawLines)
+	}
+	if sw.colPos != 0 {
+		t.Fatalf("expected colPos 0 after exact fill, got %d", sw.colPos)
+	}
+}
+
+func TestEchoRaw_WideCharWrapBoundary(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 5}}
+
+	// 4 ASCII cols + 1 wide char (2 cols) = doesn't fit on row 1.
+	// Terminal wraps the wide char to row 2.
+	sw.echoRaw([]byte("1234漢"))
+	if sw.rawLines != 1 {
+		t.Fatalf("expected 1 wrap (wide char pushed to next row), got %d", sw.rawLines)
+	}
+	if sw.colPos != 2 {
+		t.Fatalf("expected colPos 2 (wide char on new row), got %d", sw.colPos)
+	}
+}
+
+func TestEchoRaw_CarriageReturn(t *testing.T) {
+	var out bytes.Buffer
+	sw := &Writer{w: &out, opts: Options{Width: 80}}
+
+	// CR resets column without advancing row.
+	sw.echoRaw([]byte("hello\rworld"))
+	if sw.rawLines != 0 {
+		t.Fatalf("expected 0 raw lines (CR doesn't advance row), got %d", sw.rawLines)
+	}
+	if sw.colPos != 5 {
+		t.Fatalf("expected colPos 5, got %d", sw.colPos)
+	}
+}
+
 func TestEraseRaw(t *testing.T) {
 	var out bytes.Buffer
 	sw := &Writer{w: &out, opts: Options{Width: 80}}

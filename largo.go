@@ -40,12 +40,20 @@ type Options struct {
 	Margin int
 }
 
+// blockRenderer is the minimal surface largo needs from a markdown
+// renderer. *glamour.TermRenderer satisfies this. Defining it as an
+// interface (rather than holding the concrete type) lets tests inject
+// stub renderers to exercise the render-error fallback path.
+type blockRenderer interface {
+	Render(in string) (string, error)
+}
+
 // Writer implements io.Writer. It streams raw bytes to the terminal
 // immediately and replaces them with glamour-rendered output when a
 // block boundary is detected.
 type Writer struct {
 	w        io.Writer
-	renderer *glamour.TermRenderer
+	renderer blockRenderer
 	opts     Options
 
 	buf     bytes.Buffer // accumulated markdown source
@@ -91,13 +99,24 @@ func New(w io.Writer, renderer *glamour.TermRenderer, opts Options) *Writer {
 // streamingStyle returns a glamour style tuned for block-by-block rendering.
 // It removes the document-level and heading padding that glamour adds for
 // full-document renders, since those cause doubled spacing when blocks are
-// rendered independently. Returns the style option and the document margin
-// (in columns) that glamour will add to each line.
+// rendered independently. It also strips the literal "##" / "###" prefixes
+// glamour's default H2–H6 styling bakes in — in a streaming context those
+// look like unrendered markdown syntax bleeding through. Returns the style
+// option and the document margin (in columns) that glamour will add to
+// each line.
 func streamingStyle() (glamour.TermRendererOption, int) {
 	style := styles.DarkStyleConfig
 	style.Document.BlockPrefix = ""
 	style.Document.BlockSuffix = ""
 	style.Heading.BlockSuffix = ""
+
+	// H1 keeps its pill background. H2–H6 have their literal "##" prefixes
+	// cleared so they render as bold/colored text without the marker.
+	style.H2.Prefix = ""
+	style.H3.Prefix = ""
+	style.H4.Prefix = ""
+	style.H5.Prefix = ""
+	style.H6.Prefix = ""
 
 	docMargin := 0
 	if style.Document.Margin != nil {
@@ -387,38 +406,75 @@ func (sw *Writer) nextBlock() (block, rest string, found bool) {
 func (sw *Writer) renderAndWrite(block string) error {
 	rendered, err := sw.renderer.Render(block)
 	if err != nil {
-		return err
+		// Glamour failed to render this block. Fall back to writing the
+		// raw markdown source so the user sees something instead of
+		// losing a chunk of the response. The cursor-safety contract
+		// (block ends on a fresh row) still applies.
+		rendered = stripBlankLines(block) + "\n\n"
+		_, werr := io.WriteString(sw.w, rendered)
+		if werr != nil {
+			return werr
+		}
+		return nil
 	}
-	// Glamour wraps each render with leading/trailing newlines even with
-	// our custom style. Trim the leading newlines so block-by-block
-	// output doesn't accumulate extra blank lines at the top.
-	// At the trailing end, collapse to at most two newlines (one blank
-	// line) to preserve paragraph breaks without runaway spacing.
-	rendered = strings.TrimLeft(rendered, "\n")
-	rendered = trimTrailingNewlines(rendered, 2)
-
-	// Add a blank line before headings for visual separation.
-	trimmed := strings.TrimSpace(block)
-	if len(trimmed) > 0 && trimmed[0] == '#' {
-		rendered = "\n" + rendered
-	}
+	// Normalize the rendered block so every block has a uniform shape
+	// regardless of what glamour emits for this block type. Different
+	// block types wrap their output differently: hrules emit a leading
+	// row of pad spaces; headings emit zero trailing newlines; paragraphs
+	// emit one. Without normalization this bleeds into cursor drift
+	// (because the erase-replace math assumes the rendered block ends
+	// on a fresh row) and inconsistent vertical spacing between blocks.
+	//
+	// Target shape:
+	//   - No leading blank-only lines (block starts flush against prev).
+	//   - No trailing blank-only lines, then exactly two trailing
+	//     newlines: one for cursor safety (so the next raw echo lands
+	//     on a fresh row) and one blank line for readability.
+	rendered = stripBlankLines(rendered)
+	rendered += "\n\n"
 
 	_, err = io.WriteString(sw.w, rendered)
 	return err
 }
 
-// trimTrailingNewlines removes trailing newlines beyond maxNewlines.
-// Ensures the string ends with at most maxNewlines newline characters.
-func trimTrailingNewlines(s string, maxNewlines int) string {
-	end := len(s)
-	for end > 0 && s[end-1] == '\n' {
-		end--
+// stripBlankLines removes leading and trailing blank-only lines from s.
+// A blank-only line is one whose visible content (after whitespace trim,
+// ANSI escapes considered non-visible) is empty. The returned string
+// has no leading or trailing newlines.
+func stripBlankLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for len(lines) > 0 && isVisuallyBlank(lines[0]) {
+		lines = lines[1:]
 	}
-	trailing := len(s) - end
-	if trailing > maxNewlines {
-		trailing = maxNewlines
+	for len(lines) > 0 && isVisuallyBlank(lines[len(lines)-1]) {
+		lines = lines[:len(lines)-1]
 	}
-	return s[:end+trailing]
+	return strings.Join(lines, "\n")
+}
+
+// isVisuallyBlank reports whether a line contains no visible characters —
+// i.e., after stripping ANSI SGR sequences, only whitespace remains.
+func isVisuallyBlank(line string) bool {
+	i := 0
+	for i < len(line) {
+		c := line[i]
+		if c == '\x1b' && i+1 < len(line) && line[i+1] == '[' {
+			j := i + 2
+			for j < len(line) && !(line[j] >= 0x40 && line[j] <= 0x7e) {
+				j++
+			}
+			if j < len(line) {
+				j++
+			}
+			i = j
+			continue
+		}
+		if c != ' ' && c != '\t' {
+			return false
+		}
+		i++
+	}
+	return true
 }
 
 func isLineStart(s string, i int) bool {

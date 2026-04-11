@@ -121,6 +121,180 @@ func TestScenario_CodeFenceOnly(t *testing.T) {
 	}
 }
 
+func TestScenario_SuspendResume(t *testing.T) {
+	// Streams: markdown intro, then suspend + verbatim bytes (simulating
+	// bash output with ANSI), then resume + more markdown. Verifies the
+	// pass-through region is preserved on screen and the markdown that
+	// follows renders correctly without overlapping.
+	var out bytes.Buffer
+	w, err := NewWriter(&out, Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write([]byte("Running a command:\n\n"))
+
+	raw := w.Suspend()
+	// Simulate bash output, including a line that bash colored red.
+	raw.Write([]byte("file1.txt\n"))
+	raw.Write([]byte("\x1b[31mfile2.txt\x1b[0m\n"))
+	raw.Write([]byte("file3.txt\n"))
+	if err := w.Resume(); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	w.Write([]byte("Three files found.\n\n"))
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	vis := renderVisible(out.Bytes(), 80)
+	joined := strings.Join(vis, "\n")
+
+	for _, want := range []string{"Running a command", "file1.txt", "file2.txt", "file3.txt", "Three files found"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in:\n%s", want, joined)
+		}
+	}
+	if os.Getenv("V") != "" {
+		t.Logf("visible (%d rows):\n%s", len(vis), joined)
+	}
+}
+
+func TestScenario_SuspendNoTrailingNewline(t *testing.T) {
+	// If the suspended region writes bytes without a trailing newline,
+	// Resume must inject one so the next markdown block starts on a
+	// fresh row instead of overlapping.
+	var out bytes.Buffer
+	w, err := NewWriter(&out, Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write([]byte("Before.\n\n"))
+	raw := w.Suspend()
+	raw.Write([]byte("no newline at end"))
+	w.Resume()
+	w.Write([]byte("After.\n\n"))
+	w.Flush()
+
+	vis := renderVisible(out.Bytes(), 80)
+
+	// Find rows containing the three markers and assert they are all
+	// on distinct rows (no overlap).
+	rowOf := func(s string) int {
+		for i, line := range vis {
+			if strings.Contains(line, s) {
+				return i
+			}
+		}
+		return -1
+	}
+	rBefore := rowOf("Before")
+	rRaw := rowOf("no newline")
+	rAfter := rowOf("After")
+	if rBefore == -1 || rRaw == -1 || rAfter == -1 {
+		t.Fatalf("missing content: rBefore=%d rRaw=%d rAfter=%d\n%s",
+			rBefore, rRaw, rAfter, strings.Join(vis, "\n"))
+	}
+	if rBefore == rRaw || rRaw == rAfter || rBefore == rAfter {
+		t.Errorf("rows collided: rBefore=%d rRaw=%d rAfter=%d\n%s",
+			rBefore, rRaw, rAfter, strings.Join(vis, "\n"))
+	}
+}
+
+func TestScenario_ToolsStreamPattern(t *testing.T) {
+	// End-to-end test of the figaro pass-through pattern: markdown
+	// header for the tool call, suspended verbatim bash output (with
+	// ANSI), resume, more markdown.
+	var out bytes.Buffer
+	w, err := NewWriter(&out, Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write([]byte("---\nI'll list the directory:\n\n"))
+	w.Write([]byte("---\n`▶ bash` " + InlineCode("ls -la /tmp") + "\n\n"))
+
+	raw := w.Suspend()
+	raw.Write([]byte("total 24\n"))
+	raw.Write([]byte("\x1b[1;34mdir1\x1b[0m\n"))
+	raw.Write([]byte("file1.txt\n"))
+	w.Resume()
+
+	w.Write([]byte("\n---\n\nThree entries found.\n\n"))
+	w.Flush()
+
+	vis := renderVisible(out.Bytes(), 80)
+	joined := strings.Join(vis, "\n")
+
+	// All content from both the markdown and pass-through regions
+	// must appear, and pass-through bytes must NOT be glamour-margin
+	// indented (they should be flush-left).
+	for _, want := range []string{"list the directory", "▶ bash", "total 24", "dir1", "file1.txt", "Three entries found"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q\n%s", want, joined)
+		}
+	}
+
+	// Find the bash-output rows and confirm they begin at column 0,
+	// not at column 2 (glamour's margin).
+	for _, line := range vis {
+		if strings.Contains(line, "total 24") || strings.Contains(line, "file1.txt") {
+			if strings.HasPrefix(line, "  ") {
+				t.Errorf("pass-through row was glamour-indented: %q", line)
+			}
+		}
+	}
+
+	if os.Getenv("V") != "" {
+		t.Logf("visible (%d rows):\n%s", len(vis), joined)
+	}
+}
+
+func TestScenario_SuspendEmpty(t *testing.T) {
+	// Suspend immediately followed by Resume with no writes in between.
+	// Should be a clean no-op.
+	var out bytes.Buffer
+	w, err := NewWriter(&out, Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write([]byte("Before.\n\n"))
+	w.Suspend()
+	w.Resume()
+	w.Write([]byte("After.\n\n"))
+	w.Flush()
+
+	vis := renderVisible(out.Bytes(), 80)
+	joined := strings.Join(vis, "\n")
+	if !strings.Contains(joined, "Before") || !strings.Contains(joined, "After") {
+		t.Errorf("missing content:\n%s", joined)
+	}
+}
+
+func TestScenario_SuspendDoubleSuspendPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on double Suspend")
+		}
+	}()
+	w, _ := NewWriter(&bytes.Buffer{}, Options{Width: 80})
+	w.Suspend()
+	w.Suspend()
+}
+
+func TestScenario_WriteWhileSuspendedPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on Write while suspended")
+		}
+	}()
+	w, _ := NewWriter(&bytes.Buffer{}, Options{Width: 80})
+	w.Suspend()
+	w.Write([]byte("nope"))
+}
+
 // brokenRenderer always returns a render error. Used to verify the
 // fallback path falls back to raw markdown rather than swallowing the
 // block.

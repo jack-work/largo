@@ -66,6 +66,30 @@ type Writer struct {
 	// colPos tracks the column position within the current terminal row
 	// so we can account for soft wrapping.
 	colPos int
+
+	// suspended is non-nil while the writer is in pass-through mode
+	// (between Suspend and Resume). All Writer.Write/Flush calls in
+	// this state are programming errors.
+	suspended *suspendWriter
+}
+
+// suspendWriter is the io.Writer returned by Writer.Suspend. Writes go
+// straight to the underlying terminal, bypassing largo's buffering and
+// rendering. It tracks the most recent byte so Resume can decide
+// whether to inject a trailing newline.
+type suspendWriter struct {
+	w        io.Writer
+	wrote    bool
+	lastByte byte
+}
+
+func (sw *suspendWriter) Write(p []byte) (int, error) {
+	n, err := sw.w.Write(p)
+	if n > 0 {
+		sw.wrote = true
+		sw.lastByte = p[n-1]
+	}
+	return n, err
 }
 
 // terminalWidth attempts to detect the terminal width from w. Returns 0 if
@@ -159,7 +183,13 @@ func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 // Write appends p to the buffer, echoes it as raw text, and renders any
 // completed blocks. Always returns len(p), nil unless the underlying
 // writer fails.
+//
+// Calling Write while the writer is suspended (between Suspend and
+// Resume) is a programming error and panics.
 func (sw *Writer) Write(p []byte) (int, error) {
+	if sw.suspended != nil {
+		panic("largo: Write called on suspended writer; call Resume first")
+	}
 	sw.buf.Write(p)
 
 	// Echo raw bytes and track terminal rows consumed.
@@ -173,9 +203,70 @@ func (sw *Writer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Flush renders whatever remains in the buffer. Call when the stream ends
-// or before switching to a different output mode (e.g., tool output).
+// Suspend pauses markdown rendering. Any pending buffered content is
+// flushed and rendered first, leaving the cursor on a fresh row.
+// Returns an io.Writer for verbatim writes that bypass largo's
+// buffering, block detection, and rendering entirely.
+//
+// Use Suspend for content with its own native formatting (bash
+// stdout, file dumps, command-line tool output) where markdown
+// rendering would mangle ANSI colors and line structure. Call Resume
+// when done to re-enable markdown rendering.
+//
+// Calling Suspend on an already-suspended writer panics.
+func (sw *Writer) Suspend() io.Writer {
+	if sw.suspended != nil {
+		panic("largo: Suspend called on already-suspended writer")
+	}
+	// Flush any pending markdown so its rendered form is on screen
+	// before pass-through bytes start appearing. Cursor lands on a
+	// fresh row below the rendered content (renderAndWrite's
+	// trailing-newline contract).
+	_ = sw.flushLocked()
+	sw.suspended = &suspendWriter{w: sw.w}
+	return sw.suspended
+}
+
+// Resume re-enables markdown rendering after Suspend. If the suspended
+// region wrote any bytes and didn't end with a newline, Resume emits
+// one so the next markdown block starts on a fresh row. The cursor
+// model is reset; the suspended region is treated as immutable
+// content above the rendering region (subsequent erase-replace will
+// not touch it).
+//
+// Calling Resume on a writer that isn't suspended is a no-op.
+func (sw *Writer) Resume() error {
+	s := sw.suspended
+	if s == nil {
+		return nil
+	}
+	sw.suspended = nil
+	if s.wrote && s.lastByte != '\n' {
+		if _, err := sw.w.Write([]byte{'\n'}); err != nil {
+			return err
+		}
+	}
+	// Cursor is now at col 0 on a fresh row above the new rendering
+	// region. The pass-through region is permanent — largo's erase
+	// math should not reach it.
+	sw.rawLines = 0
+	sw.colPos = 0
+	return nil
+}
+
+// Flush renders whatever remains in the buffer. Call when the stream
+// ends or before switching to a different output mode (e.g., tool
+// output). Flush on a suspended writer is a no-op (the buffer was
+// already flushed by Suspend, and there's no markdown rendering to do
+// while suspended).
 func (sw *Writer) Flush() error {
+	if sw.suspended != nil {
+		return nil
+	}
+	return sw.flushLocked()
+}
+
+func (sw *Writer) flushLocked() error {
 	if sw.buf.Len() == 0 {
 		return nil
 	}

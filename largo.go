@@ -35,6 +35,13 @@ type Options struct {
 	// Defaults to auto-detected terminal width, falling back to 80.
 	Width int
 
+	// Height is the terminal height in rows. Only used when Reserved
+	// > 0. Defaults to auto-detected from the writer when it's a
+	// *os.File; callers wrapping stdout (mutex, multiplexer, etc)
+	// should set this explicitly so the scroll region can be
+	// computed correctly.
+	Height int
+
 	// Reserved is the number of rows at the bottom of the terminal the
 	// caller wants to keep clear of largo output (e.g. a pinned status
 	// line). When > 0, largo sets a scroll region of rows
@@ -42,8 +49,7 @@ type Options struct {
 	// Largo's own writes stay above the reserved zone; the caller is
 	// responsible for what goes into those rows.
 	//
-	// Requires the underlying writer to be a *os.File backed by a TTY.
-	// Has no effect otherwise.
+	// Has no effect when the resolved height is unknown.
 	Reserved int
 
 	// Margin is deprecated. The correct word-wrap width is now computed
@@ -196,6 +202,9 @@ func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 	if opts.Width <= 0 {
 		opts.Width = 80
 	}
+	if opts.Height <= 0 {
+		opts.Height = rows
+	}
 
 	styleOpt, docMargin := streamingStyle()
 	wrapWidth := opts.Width - docMargin
@@ -211,14 +220,14 @@ func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 		w:        w,
 		renderer: r,
 		opts:     opts,
-		height:   rows,
+		height:   opts.Height,
 	}
-	if opts.Reserved > 0 && rows > opts.Reserved+1 {
+	if opts.Reserved > 0 && opts.Height > opts.Reserved+1 {
 		// Set scroll region rows 1..(height - Reserved). Park the
 		// cursor at the bottom of the region so the first write
 		// scrolls upward as new lines arrive, leaving the reserved
 		// rows untouched.
-		bottom := rows - opts.Reserved
+		bottom := opts.Height - opts.Reserved
 		fmt.Fprintf(w, "\033[1;%dr\033[%d;1H", bottom, bottom)
 		sw.regionSet = true
 	}

@@ -223,12 +223,15 @@ func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 		height:   opts.Height,
 	}
 	if opts.Reserved > 0 && opts.Height > opts.Reserved+1 {
-		// Set scroll region rows 1..(height - Reserved). Park the
-		// cursor at the bottom of the region so the first write
-		// scrolls upward as new lines arrive, leaving the reserved
-		// rows untouched.
+		// Set scroll region rows 1..(height - Reserved). DECSTBM
+		// usually moves the cursor to the region's home (1,1), which
+		// would overwrite the caller's existing terminal state.
+		// Save/restore around DECSTBM so the cursor returns to wherever
+		// the caller had it — largo writes from there, content flows
+		// downward until it hits the region bottom and starts scrolling
+		// within the reserved zone.
 		bottom := opts.Height - opts.Reserved
-		fmt.Fprintf(w, "\033[1;%dr\033[%d;1H", bottom, bottom)
+		fmt.Fprintf(w, "\033 7\033[1;%dr\033 8", bottom)
 		sw.regionSet = true
 	}
 	return sw, nil

@@ -16,6 +16,7 @@ package largo
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -33,6 +34,17 @@ type Options struct {
 	// terminal rows a line of raw text occupies (for accurate erasure).
 	// Defaults to auto-detected terminal width, falling back to 80.
 	Width int
+
+	// Reserved is the number of rows at the bottom of the terminal the
+	// caller wants to keep clear of largo output (e.g. a pinned status
+	// line). When > 0, largo sets a scroll region of rows
+	// 1..(height-Reserved) on construction and restores it on Close.
+	// Largo's own writes stay above the reserved zone; the caller is
+	// responsible for what goes into those rows.
+	//
+	// Requires the underlying writer to be a *os.File backed by a TTY.
+	// Has no effect otherwise.
+	Reserved int
 
 	// Margin is deprecated. The correct word-wrap width is now computed
 	// automatically from the glamour style's document margin. Callers
@@ -67,6 +79,14 @@ type Writer struct {
 	// so we can account for soft wrapping.
 	colPos int
 
+	// height is the terminal row count; tracked for Reserved-zone math.
+	// Zero means we never set a scroll region (Options.Reserved == 0 or
+	// detection failed).
+	height int
+	// regionSet records whether NewWriter set a scroll region; Close
+	// restores it iff true.
+	regionSet bool
+
 	// suspended is non-nil while the writer is in pass-through mode
 	// (between Suspend and Resume). All Writer.Write/Flush calls in
 	// this state are programming errors.
@@ -95,12 +115,19 @@ func (sw *suspendWriter) Write(p []byte) (int, error) {
 // terminalWidth attempts to detect the terminal width from w. Returns 0 if
 // w is not a terminal.
 func terminalWidth(w io.Writer) int {
+	cols, _ := terminalSize(w)
+	return cols
+}
+
+// terminalSize returns (cols, rows) for w if it's a TTY-backed
+// *os.File, else (0, 0).
+func terminalSize(w io.Writer) (int, int) {
 	if f, ok := w.(*os.File); ok {
-		if w, _, err := term.GetSize(int(f.Fd())); err == nil {
-			return w
+		if c, r, err := term.GetSize(int(f.Fd())); err == nil {
+			return c, r
 		}
 	}
-	return 0
+	return 0, 0
 }
 
 // New creates a Writer that streams to w with glamour rendering.
@@ -155,9 +182,16 @@ func streamingStyle() (glamour.TermRendererOption, int) {
 // The word-wrap width is computed automatically: terminal width minus the
 // glamour style's document margin, so rendered output fits the terminal
 // exactly without overflow or wasted columns.
+//
+// When opts.Reserved > 0 and w is a TTY, NewWriter installs a DEC scroll
+// region of rows 1..(height - Reserved) so largo's bulk output stays
+// above the reserved zone. Callers must invoke Close to restore the
+// default region; otherwise the user's shell prompt will inherit the
+// reduced region.
 func NewWriter(w io.Writer, opts Options) (*Writer, error) {
+	cols, rows := terminalSize(w)
 	if opts.Width <= 0 {
-		opts.Width = terminalWidth(w)
+		opts.Width = cols
 	}
 	if opts.Width <= 0 {
 		opts.Width = 80
@@ -173,11 +207,39 @@ func NewWriter(w io.Writer, opts Options) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{
+	sw := &Writer{
 		w:        w,
 		renderer: r,
 		opts:     opts,
-	}, nil
+		height:   rows,
+	}
+	if opts.Reserved > 0 && rows > opts.Reserved+1 {
+		// Set scroll region rows 1..(height - Reserved). Park the
+		// cursor at the bottom of the region so the first write
+		// scrolls upward as new lines arrive, leaving the reserved
+		// rows untouched.
+		bottom := rows - opts.Reserved
+		fmt.Fprintf(w, "\033[1;%dr\033[%d;1H", bottom, bottom)
+		sw.regionSet = true
+	}
+	return sw, nil
+}
+
+// Close restores the default scroll region and parks the cursor below
+// the reserved zone. Idempotent. Safe to call when no region was set.
+func (sw *Writer) Close() error {
+	if !sw.regionSet {
+		return nil
+	}
+	sw.regionSet = false
+	// Reset region to full screen, then move cursor below the
+	// previously-reserved bottom (so subsequent shell output starts
+	// after our last scroll-region row).
+	bottom := sw.height - sw.opts.Reserved
+	if _, err := fmt.Fprintf(sw.w, "\033[r\033[%d;1H", bottom+1); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Write appends p to the buffer, echoes it as raw text, and renders any

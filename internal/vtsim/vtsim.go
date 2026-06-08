@@ -15,12 +15,17 @@ import (
 )
 
 // Screen is an unbounded grid. Rows grow as needed; each row is a slice
-// of runes with width-aware placement.
+// of runes with width-aware placement. Wrap behavior models a real
+// xterm/VTE-class terminal: filling the last column arms a deferred
+// wrap (cursor parks at column W), and the wrap is consumed by the
+// next printable rune. \n / \r cancel the pending wrap without an
+// extra row advance.
 type Screen struct {
-	Width int
-	rows  [][]rune
-	row   int
-	col   int
+	Width   int
+	rows    [][]rune
+	row     int
+	col     int
+	pending bool // deferred wrap armed
 }
 
 func New(width int) *Screen {
@@ -35,11 +40,13 @@ func (s *Screen) Feed(p []byte) {
 
 		switch {
 		case b == '\n':
+			s.pending = false
 			s.row++
 			s.col = 0
 			s.ensureRow(s.row)
 			i++
 		case b == '\r':
+			s.pending = false
 			s.col = 0
 			i++
 		case b == '\x1b' && i+1 < len(p) && p[i+1] == '[':
@@ -89,6 +96,7 @@ func (s *Screen) handleCSI(params string, final byte) {
 		if s.row < 0 {
 			s.row = 0
 		}
+		s.pending = false
 	case 'B': // cursor down
 		s.row += n
 		s.ensureRow(s.row)
@@ -135,6 +143,15 @@ func (s *Screen) putRune(r rune) {
 	if w == 0 {
 		return
 	}
+	// Deferred wrap: a pending wrap is consumed by this printable rune
+	// BEFORE it is placed. The cursor moves to the next row, col 0,
+	// and the rune is written there.
+	if s.pending {
+		s.row++
+		s.col = 0
+		s.pending = false
+		s.ensureRow(s.row)
+	}
 	if s.col+w > s.Width {
 		s.row++
 		s.col = 0
@@ -164,6 +181,10 @@ func (s *Screen) putRune(r rune) {
 	}
 	s.rows[s.row] = row
 	s.col += w
+	if s.col == s.Width {
+		// Exact fill: park the cursor and arm the deferred wrap.
+		s.pending = true
+	}
 }
 
 // Lines returns the visible text lines with trailing whitespace trimmed

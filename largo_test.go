@@ -186,13 +186,19 @@ func TestEchoRaw_ANSISoftWrap(t *testing.T) {
 	var out bytes.Buffer
 	sw := &Writer{w: &out, opts: Options{Width: 10}}
 
-	// 10 visible chars + ANSI escapes should wrap exactly once.
+	// 10 visible chars + ANSI escapes. On a deferred-wrap terminal,
+	// exact fill parks the cursor at col 10 without advancing the row
+	// — pendingWrap is armed, rawLines stays 0. The next printable (if
+	// any) would consume the wrap; here nothing follows.
 	sw.echoRaw([]byte("\x1b[32m1234567890\x1b[0m"))
-	if sw.rawLines != 1 {
-		t.Fatalf("expected 1 soft-wrap line, got %d", sw.rawLines)
+	if sw.rawLines != 0 {
+		t.Fatalf("expected 0 rawLines (deferred wrap not consumed), got %d", sw.rawLines)
 	}
-	if sw.colPos != 0 {
-		t.Fatalf("expected colPos 0 after exact fill, got %d", sw.colPos)
+	if !sw.pendingWrap {
+		t.Fatalf("expected pendingWrap=true after exact fill")
+	}
+	if sw.colPos != 10 {
+		t.Fatalf("expected colPos 10 after exact fill, got %d", sw.colPos)
 	}
 }
 
@@ -233,13 +239,18 @@ func TestEchoRaw_CJKWideChars(t *testing.T) {
 	var out bytes.Buffer
 	sw := &Writer{w: &out, opts: Options{Width: 10}}
 
-	// 5 CJK characters = 10 columns = exactly fills width
+	// 5 CJK characters = 10 columns = exactly fills width. Deferred-
+	// wrap rule: cursor parks at col 10, pendingWrap armed, rawLines
+	// stays 0 until the next printable arrives.
 	sw.echoRaw([]byte("漢字漢字漢"))
-	if sw.rawLines != 1 {
-		t.Fatalf("expected 1 soft-wrap, got %d", sw.rawLines)
+	if sw.rawLines != 0 {
+		t.Fatalf("expected 0 rawLines (deferred wrap not consumed), got %d", sw.rawLines)
 	}
-	if sw.colPos != 0 {
-		t.Fatalf("expected colPos 0 after exact fill, got %d", sw.colPos)
+	if !sw.pendingWrap {
+		t.Fatalf("expected pendingWrap=true after exact fill")
+	}
+	if sw.colPos != 10 {
+		t.Fatalf("expected colPos 10 after exact fill, got %d", sw.colPos)
 	}
 }
 

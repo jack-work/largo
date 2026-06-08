@@ -77,13 +77,20 @@ type Writer struct {
 	buf     bytes.Buffer // accumulated markdown source
 	inFence bool
 
-	// rawLines tracks the number of terminal rows consumed by raw output
-	// for the current (incomplete) block. When a block completes we erase
-	// this many rows before writing the rendered replacement.
+	// rawLines tracks the number of physical rows the cursor has
+	// descended from where the current raw block began. Bumped by
+	// newlines and by consumed deferred wraps (see pendingWrap). Not
+	// bumped by exact-fill alone — on a deferred-wrap terminal the
+	// cursor parks at the last column until the next printable rune.
 	rawLines int
-	// colPos tracks the column position within the current terminal row
-	// so we can account for soft wrapping.
+	// colPos tracks the column position within the current terminal row.
 	colPos int
+	// pendingWrap is true when the previous printable rune filled the
+	// row exactly (colPos == Width). On a real terminal (xterm/VTE/kitty/
+	// alacritty) the cursor parks at column W; it only physically
+	// advances to the next row when another printable arrives. A \n or
+	// \r consumes the pending wrap without an additional row bump.
+	pendingWrap bool
 
 	// height is the terminal row count; tracked for Reserved-zone math.
 	// Zero means we never set a scroll region (Options.Reserved == 0 or
@@ -325,6 +332,7 @@ func (sw *Writer) Resume() error {
 	// math should not reach it.
 	sw.rawLines = 0
 	sw.colPos = 0
+	sw.pendingWrap = false
 	return nil
 }
 
@@ -359,27 +367,35 @@ func (sw *Writer) echoRaw(p []byte) error {
 	if _, err := sw.w.Write(p); err != nil {
 		return err
 	}
-	// Track terminal rows consumed using rune widths.
+	// Track terminal rows consumed using rune widths. The model is
+	// deferred-wrap to match real terminals: exact-fill arms a pending
+	// wrap that is consumed by the NEXT printable rune. \n / \r consume
+	// the pending wrap without double-bumping the row count.
 	i := 0
 	for i < len(p) {
 		b := p[i]
 
-		// Newline: always moves to next row.
+		// Newline: always moves to next row. If a wrap was pending,
+		// the \n consumes it — the cursor only descends by one.
 		if b == '\n' {
 			sw.rawLines++
 			sw.colPos = 0
+			sw.pendingWrap = false
 			i++
 			continue
 		}
 
 		// Carriage return: moves to column 0 without advancing row.
+		// Cancels any pending wrap (real xterms behave this way).
 		if b == '\r' {
 			sw.colPos = 0
+			sw.pendingWrap = false
 			i++
 			continue
 		}
 
 		// ANSI escape sequence: skip entirely (zero visual width).
+		// Does NOT consume a pending wrap — only printables do.
 		if b == '\x1b' && i+1 < len(p) && p[i+1] == '[' {
 			// CSI sequence: \x1b[ ... <terminator>
 			j := i + 2
@@ -393,13 +409,23 @@ func (sw *Writer) echoRaw(p []byte) error {
 			continue
 		}
 
-		// Tab: advance to next 8-column tab stop.
+		// Tab: advance to next 8-column tab stop. A pending wrap is
+		// consumed first (tab is a printable advance from the terminal's
+		// perspective — the cursor moves before placing the spaces).
 		if b == '\t' {
-			advance := 8 - (sw.colPos % 8)
-			sw.colPos += advance
-			if sw.colPos >= sw.opts.Width {
+			if sw.pendingWrap {
 				sw.rawLines++
 				sw.colPos = 0
+				sw.pendingWrap = false
+			}
+			advance := 8 - (sw.colPos % 8)
+			sw.colPos += advance
+			if sw.colPos > sw.opts.Width {
+				// Tab overshot the row; terminal wraps to next.
+				sw.rawLines++
+				sw.colPos = 0
+			} else if sw.colPos == sw.opts.Width {
+				sw.pendingWrap = true
 			}
 			i++
 			continue
@@ -414,18 +440,27 @@ func (sw *Writer) echoRaw(p []byte) error {
 		// Decode a full rune and measure its display width.
 		r, size := utf8.DecodeRune(p[i:])
 		w := runewidth.RuneWidth(r)
-		sw.colPos += w
-		if sw.colPos > sw.opts.Width {
-			// Character doesn't fit on current line — terminal wraps
-			// before printing it, so it starts on the next row.
-			sw.rawLines++
-			sw.colPos = w
-		} else if sw.colPos == sw.opts.Width {
-			// Exactly filled the row. Terminal may or may not wrap yet
-			// (deferred wrap). Treat as wrapped — the next visible
-			// character will be on a new row.
+
+		// Consume any pending wrap BEFORE placing this rune: the rune
+		// is what causes the terminal to finally advance the cursor.
+		if sw.pendingWrap {
 			sw.rawLines++
 			sw.colPos = 0
+			sw.pendingWrap = false
+		}
+
+		sw.colPos += w
+		if sw.colPos > sw.opts.Width {
+			// Wide character doesn't fit on the current row — the
+			// terminal moves it to the next row before printing.
+			sw.rawLines++
+			sw.colPos = w
+		}
+		if sw.colPos == sw.opts.Width {
+			// Exactly filled the row — arm the deferred wrap. The
+			// cursor remains parked here until the next printable
+			// rune (or a \n / \r) arrives.
+			sw.pendingWrap = true
 		}
 		i += size
 	}
@@ -441,7 +476,7 @@ func isCSITerminator(b byte) bool {
 // eraseRaw moves the cursor up and clears each row of raw output, leaving
 // the cursor at the position where the raw block started.
 func (sw *Writer) eraseRaw() error {
-	if sw.rawLines == 0 && sw.colPos == 0 {
+	if sw.rawLines == 0 && sw.colPos == 0 && !sw.pendingWrap {
 		return nil
 	}
 
@@ -455,6 +490,7 @@ func (sw *Writer) eraseRaw() error {
 
 	sw.rawLines = 0
 	sw.colPos = 0
+	sw.pendingWrap = false
 
 	_, err := sw.w.Write(esc.Bytes())
 	return err
